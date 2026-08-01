@@ -43,6 +43,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import tempfile
 import time
@@ -103,7 +104,11 @@ GRAPH_RRF_K = 5
 # **这个数与 embedding 模型绑定**（当前是 bge-small-zh-v1.5，512 维）——换模型
 # 余弦标度就变了，必须重新量，不能照抄。真实语料复核已做（2026.08.01）。零依赖路径**不适用**这个阈值（bigram
 # 余弦是另一套标度），所以它只在 self.embed 为真时生效。
-EMBED_HIT_FLOOR = 0.45
+#
+# LATENT_EMBED_HIT_FLOOR：给换了 embedding 后端/模型的人（见 chunking_experiment
+# 的 LATENT_EMBED_URL）一个不改源码的覆盖口。覆盖值必须在自己语料上量过——上面
+# 整段论证对"照抄一个数"的警告，对这个环境变量同样成立。
+EMBED_HIT_FLOOR = float(os.environ.get("LATENT_EMBED_HIT_FLOOR", "0.45"))
 
 # 查询缺失率的标注阈值（2026.08.01，第二份外部反馈在其真实语料上标定，60 条样本）。
 #

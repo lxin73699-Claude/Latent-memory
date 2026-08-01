@@ -56,9 +56,34 @@ def cosine(a: Counter, b: Counter) -> float:
 
 
 # ---------- 可选真embedding（--embed） ----------
+#
+# 两条路径，按 LATENT_EMBED_URL 是否设置分流：
+#   本地 fastembed（默认）——bge-small-zh-v1.5，行为与之前完全一致。
+#   OpenAI 兼容 HTTP 端点（设了 LATENT_EMBED_URL 即启用）——给装不动 onnxruntime 的
+#   低内存主机：2G 内存的 VPS 上装 fastembed 全家（onnxruntime 几百 MB）实测会把
+#   整机挤进 swap 假死，但这类主机调一个云 embedding API 毫无压力（硅基流动的
+#   BAAI/bge-m3 就有免费档）。HTTP 路径只用 stdlib urllib，不新增任何依赖——
+#   numpy 本来就是 --embed 路径的既有依赖，维持不变。
+#
+# 环境变量（只在 HTTP 路径下生效，除 QUERY_PREFIX 外）：
+#   LATENT_EMBED_URL           OpenAI 兼容的 /v1/embeddings 完整地址（设了即启用 HTTP 路径）
+#   LATENT_EMBED_MODEL         模型名，如 BAAI/bge-m3
+#   LATENT_EMBED_API_KEY       Bearer key；留空则不发 Authorization 头（本地推理服务不需要）
+#   LATENT_EMBED_QUERY_PREFIX  query 侧指令前缀。**不设时两条路径默认不同**：本地档
+#                              默认 bge-zh 模型卡要求的中文指令；HTTP 档默认空——
+#                              bge-m3 这类指令自由模型加了前缀反而伤召回。用带指令的
+#                              云模型时自己设。
+#
+# ⚠️ 换 embedding 模型必须重新审视 memory_retrieval.EMBED_HIT_FLOOR——那个 0.45 与
+# bge-small-zh-v1.5 绑定（该常量的 docstring 有完整论证），余弦标度换模型就变。
+# 可用 LATENT_EMBED_HIT_FLOOR 覆盖，但覆盖值要在自己语料上量过，不能照抄。
+
+import os as _os
 
 BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："  # bge-zh模型卡要求：query侧加指令，passage侧不加
 _EMBEDDER = None
+_HTTP_BATCH = 64          # 每请求条数：主流 embeddings API 的常见批量上限档
+_HTTP_TRUNC = 2000        # 单条截断字符数：护住 API 侧 token 上限；原子记忆远小于此
 
 
 def get_embedder():
@@ -69,12 +94,42 @@ def get_embedder():
     return _EMBEDDER
 
 
+def _http_embed(texts):
+    """OpenAI 兼容 /v1/embeddings。返回按输入顺序排列的向量列表（未归一化）。"""
+    import json as _json
+    import urllib.request
+    url = _os.environ["LATENT_EMBED_URL"]
+    headers = {"Content-Type": "application/json"}
+    key = _os.environ.get("LATENT_EMBED_API_KEY", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    out = []
+    for i in range(0, len(texts), _HTTP_BATCH):
+        batch = [t[:_HTTP_TRUNC] for t in texts[i:i + _HTTP_BATCH]]
+        req = urllib.request.Request(
+            url, method="POST", headers=headers,
+            data=_json.dumps({"model": _os.environ.get("LATENT_EMBED_MODEL", ""),
+                              "input": batch}).encode())
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = _json.loads(r.read())
+        # 按 index 重排——OpenAI 规格允许乱序返回，靠列表顺序是隐性雷
+        out += [d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"])]
+    return out
+
+
 def embed_texts(texts, is_query=False):
     """返回单位化后的向量矩阵(numpy)。fastembed的query_embed对bge不加中文指令，前缀自己加"""
     import numpy as np
+    http_mode = bool(_os.environ.get("LATENT_EMBED_URL"))
     if is_query:
-        texts = [BGE_QUERY_PREFIX + t for t in texts]
-    vecs = np.array(list(get_embedder().embed(texts)))
+        prefix = _os.environ.get("LATENT_EMBED_QUERY_PREFIX")
+        if prefix is None:
+            prefix = "" if http_mode else BGE_QUERY_PREFIX
+        texts = [prefix + t for t in texts]
+    if http_mode:
+        vecs = np.array(_http_embed(texts))
+    else:
+        vecs = np.array(list(get_embedder().embed(texts)))
     return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
 
 
@@ -264,12 +319,68 @@ def _selftest(embed=False):
     # answer子串校验路径（evaluate之前由run做，这里直接验证判断逻辑）
     assert "保险丝熔断" in SYNTH
 
+    # HTTP embedding 路径：mock urlopen，不联网、不需要任何依赖（numpy 除外时跳过）
+    _selftest_http_embed()
+
     if embed:  # 真embedding路径（需fastembed，仅--selftest --embed时跑）
         se = chunk_semantic(SYNTH, min_chunk=100, embed=True)
         assert len(se) > 1, "embed semantic切法至少要切出两块"
         re_ = evaluate(SYNTH_QUERIES, h, embed=True)
         assert re_["hit@3"] == 1.0, re_
     print("selftest ok" + ("（含embed路径）" if embed else ""))
+
+
+def _selftest_http_embed():
+    """HTTP 路径自检：验证分批、按 index 重排、归一化、query 前缀的两档默认。
+    全程 mock urllib.request.urlopen——selftest 不联网是本仓库的既有纪律。"""
+    try:
+        import numpy as np
+    except ImportError:
+        print("  (跳过 HTTP embedding 自检：无 numpy——它是 --embed 路径既有依赖)")
+        return
+    import io
+    import json as _json
+    import urllib.request as _ur
+
+    calls = []
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _fake_urlopen(req, timeout=0):
+        body = _json.loads(req.data)
+        calls.append(body)
+        # 刻意乱序返回，验证按 index 重排那道防线
+        data = [{"index": i, "embedding": [float(i + 1), 1.0, 0.0]}
+                for i in range(len(body["input"]))]
+        return _FakeResp(_json.dumps({"data": list(reversed(data))}).encode())
+
+    real_urlopen, real_env = _ur.urlopen, dict(_os.environ)
+    _ur.urlopen = _fake_urlopen
+    _os.environ["LATENT_EMBED_URL"] = "http://selftest.invalid/v1/embeddings"
+    _os.environ["LATENT_EMBED_MODEL"] = "selftest-model"
+    _os.environ.pop("LATENT_EMBED_QUERY_PREFIX", None)
+    try:
+        texts = [f"合成句子{i}" for i in range(_HTTP_BATCH + 3)]  # 跨批
+        vecs = embed_texts(texts)
+        assert vecs.shape == (len(texts), 3), vecs.shape
+        assert len(calls) == 2 and len(calls[0]["input"]) == _HTTP_BATCH, "应按 _HTTP_BATCH 分批"
+        assert np.allclose(np.linalg.norm(vecs, axis=1), 1.0), "必须单位化"
+        # 乱序返回被重排：第 i 条向量归一化前首位是 i+1，据此校验顺序
+        assert vecs[0][0] < vecs[1][0], "index 重排失效"
+        # query 前缀：HTTP 档默认空（bge-m3 类指令自由模型），设了环境变量则用之
+        calls.clear()
+        embed_texts(["查询"], is_query=True)
+        assert calls[0]["input"][0] == "查询", "HTTP 档 query 默认不加前缀"
+        _os.environ["LATENT_EMBED_QUERY_PREFIX"] = "指令："
+        calls.clear()
+        embed_texts(["查询"], is_query=True)
+        assert calls[0]["input"][0] == "指令：查询", "自定义前缀未生效"
+    finally:
+        _ur.urlopen = real_urlopen
+        _os.environ.clear()
+        _os.environ.update(real_env)
 
 
 if __name__ == "__main__":
